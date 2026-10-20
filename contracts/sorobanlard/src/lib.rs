@@ -27,6 +27,8 @@
 //! ## Privileged Operations (multi-sig — both Admin + Secondary Admin required)
 //! - `withdraw_tokens` — emergency sweep of contract-held tokens (both admins required)
 //! - `archive_course` — permanent course removal; may trigger student refunds
+//! - `resolve_arbitration` — finalizes an open dispute and disburses the held
+//!   arbitration fee to the student or instructor (both admins required)
 //! - `transfer_admin` — proposes a new admin pair (new admins must then call `accept_admin`)
 //! - `update_treasury` — schedules a new treasury address (takes effect after 100 ledgers)
 //! - `set_admin_expiry` — sets a ledger sequence when the admin role expires (blocks all admin operations)
@@ -245,6 +247,14 @@ pub struct ArbitrationCase {
     pub opened_at_ledger: u32,
     /// Current status of the case.
     pub status: DisputeStatus,
+    /// Admin address that co-signed the resolution, if resolved. The
+    /// SecondaryAdmin co-signer is included in the `arbitration_resolved`
+    /// event.
+    pub resolved_by: Option<Address>,
+    /// Ledger sequence when the case was resolved, if resolved.
+    pub resolved_at_ledger: Option<u32>,
+    /// Reason / ruling note supplied by the resolving admins, if resolved.
+    pub resolution_reason: Option<String>,
 }
 
 /// Configuration for risk-based fee surcharges.
@@ -654,6 +664,13 @@ pub enum DataKey2 {
     HighValueCourseThreshold,
     /// Stores the first approver's address for a high-value course pending co-signature
     HighValueCourseApproval(String),
+    /// Append-only list of caller addresses that have opened an arbitration
+    /// case for a course. Preserved after resolution so the full dispute
+    /// history for the course remains enumerable.
+    CourseArbitrationCases(String),
+    /// Append-only list of course IDs for which a student has opened an
+    /// arbitration case. Preserved after resolution.
+    StudentArbitrationCases(Address),
 }
 
 /// A proposed contract code upgrade awaiting its governance time-lock.
@@ -5745,10 +5762,21 @@ impl SorobanLardContract {
             fee_paid: config.fee_per_case,
             opened_at_ledger: env.ledger().sequence(),
             status: DisputeStatus::Open,
+            resolved_by: None,
+            resolved_at_ledger: None,
+            resolution_reason: None,
         };
 
         env.storage().persistent().set(&case_key, &record);
         Self::extend_persistent_ttl(&env, &case_key);
+
+        // Maintain the append-only course and student indexes so the full
+        // dispute history can be enumerated without knowing every caller in
+        // advance. A caller can only have one case record per course (the
+        // record is overwritten on re-escalation after resolution), so the
+        // caller/course is only appended the first time it is seen.
+        Self::append_course_arbitration_case(&env, &course_id, &caller);
+        Self::append_student_arbitration_case(&env, &caller, &course_id);
 
         env.events().publish(
             (Symbol::new(&env, "dispute_escalated"), course_id.clone()),
@@ -5764,12 +5792,65 @@ impl SorobanLardContract {
         caller: Address,
         course_id: String,
     ) -> Option<ArbitrationCase> {
-        env.storage()
-            .persistent()
-            .get(&ArbitrationCaseKey { caller, course_id })
+        Self::get_arbitration_case_internal(&env, &caller, &course_id)
     }
 
-    /// Admin function to resolve an open arbitration case and disburse the fee.
+    /// Enumerate every arbitration case ever opened for a course, in
+    /// escalation order.
+    ///
+    /// The index is append-only: resolving a case changes its `status` but
+    /// never removes it from this list, so the full dispute history for a
+    /// course remains available on-chain. Returns an empty list if the course
+    /// has no disputes.
+    pub fn get_arbitration_cases_by_course(env: Env, course_id: String) -> Vec<ArbitrationCase> {
+        let callers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::CourseArbitrationCases(course_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut cases = Vec::new(&env);
+        for i in 0..callers.len() {
+            let caller = callers.get(i).unwrap();
+            if let Some(case) = Self::get_arbitration_case_internal(&env, &caller, &course_id) {
+                cases.push_back(case);
+            }
+        }
+        cases
+    }
+
+    /// Enumerate every arbitration case ever opened by a student, in
+    /// escalation order across all courses.
+    ///
+    /// Returns an empty list if the student has never escalated a dispute.
+    pub fn get_arbitration_cases_by_student(env: Env, student: Address) -> Vec<ArbitrationCase> {
+        let course_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::StudentArbitrationCases(student.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut cases = Vec::new(&env);
+        for i in 0..course_ids.len() {
+            let course_id = course_ids.get(i).unwrap();
+            if let Some(case) = Self::get_arbitration_case_internal(&env, &student, &course_id) {
+                cases.push_back(case);
+            }
+        }
+        cases
+    }
+
+    /// Resolve an open arbitration case and disburse the held fee.
+    ///
+    /// Resolution moves real funds, so it requires both the Admin and the
+    /// Secondary Admin to co-sign — matching the platform's other
+    /// fund-moving operations (`withdraw_tokens`, `archive_course`, ...).
+    /// Requiring both keys means no single compromised admin can award a
+    /// dispute unilaterally. A revocation-style challenge window is a poor
+    /// fit here because arbitration pays the fee out immediately: reversing
+    /// the ruling would require clawing tokens back from a recipient who may
+    /// already have spent them, whereas the co-signature prevents a bad
+    /// ruling before any funds move.
     ///
     /// - `for_student = true`  — refund the fee to the original caller (student won).
     /// - `for_student = false` — transfer the fee to the course instructor (instructor won).
@@ -5784,12 +5865,15 @@ impl SorobanLardContract {
     pub fn resolve_arbitration(
         env: Env,
         admin: Address,
+        secondary_admin: Address,
         caller: Address,
         course_id: String,
         for_student: bool,
+        reason: String,
     ) {
         admin.require_auth();
-        Self::require_admin(&env, &admin, "resolve_arbitration");
+        secondary_admin.require_auth();
+        Self::require_multi_admin(&env, &admin, &secondary_admin);
         env.storage()
             .instance()
             .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_EXTEND_TO);
@@ -5813,6 +5897,7 @@ impl SorobanLardContract {
         }
 
         let token_client = token::Client::new(&env, &case.token);
+        let resolved_at_ledger = env.ledger().sequence();
 
         if for_student {
             // Refund the fee to the student who escalated.
@@ -5831,6 +5916,10 @@ impl SorobanLardContract {
             );
             case.status = DisputeStatus::ResolvedForInstructor;
         }
+
+        case.resolved_by = Some(admin.clone());
+        case.resolved_at_ledger = Some(resolved_at_ledger);
+        case.resolution_reason = Some(reason.clone());
 
         env.storage().persistent().set(&case_key, &case);
         Self::extend_persistent_ttl(&env, &case_key);

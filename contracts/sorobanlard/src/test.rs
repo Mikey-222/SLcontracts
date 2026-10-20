@@ -10811,14 +10811,19 @@ fn test_escalation_creates_retrievable_arbitration_case() {
         "case must record the escalating student"
     );
     assert_eq!(case.course_id, course_id, "case must record the course id");
-    assert_eq!(
-        case.fee_paid, fee_per_case,
-        "fee_paid must match config.fee_per_case"
+    assert_eq!(case.fee_paid, fee_per_case, "fee_paid must match config.fee_per_case");
+    assert_eq!(case.status, DisputeStatus::Open, "newly created case must be Open");
+    assert!(
+        case.resolved_by.is_none(),
+        "an open case must not have a resolver"
     );
-    assert_eq!(
-        case.status,
-        DisputeStatus::Open,
-        "newly created case must be Open"
+    assert!(
+        case.resolved_at_ledger.is_none(),
+        "an open case must not have a resolution ledger"
+    );
+    assert!(
+        case.resolution_reason.is_none(),
+        "an open case must not have a resolution reason"
     );
 }
 
@@ -10847,10 +10852,156 @@ fn test_duplicate_escalation_rejected() {
     client.escalate_to_arbitration(&student, &course_id);
 }
 
+/// Mint funds for a fresh student and enroll them in an existing course.
+fn mint_and_enroll_student(
+    env: &Env,
+    client: &SorobanLardContractClient,
+    token_id: &Address,
+    course_id: &str,
+) -> Address {
+    let student = Address::generate(env);
+    token::StellarAssetClient::new(env, token_id).mint(&student, &100_000_000_000);
+    client.enroll(&student, &String::from_str(env, course_id));
+    student
+}
+
+/// Disputes for the same course must be enumerable via the append-only
+/// course index, including after resolution.
+#[test]
+fn test_arbitration_cases_indexed_by_course() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_arbitration_fee_config(&admin, &5_000_000);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-INDEX",
+        1_000_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-ARB-INDEX");
+    let first = mint_and_enroll_student(&env, &client, &token_id, "COURSE-ARB-INDEX");
+    let second = mint_and_enroll_student(&env, &client, &token_id, "COURSE-ARB-INDEX");
+    let third = mint_and_enroll_student(&env, &client, &token_id, "COURSE-ARB-INDEX");
+
+    assert_eq!(
+        client.get_arbitration_cases_by_course(&course_id).len(),
+        0,
+        "a course with no disputes must return an empty list"
+    );
+
+    client.escalate_to_arbitration(&first, &course_id);
+    client.escalate_to_arbitration(&second, &course_id);
+
+    let cases = client.get_arbitration_cases_by_course(&course_id);
+    assert_eq!(cases.len(), 2, "both disputes must be indexed");
+    assert_eq!(cases.get(0).unwrap().caller, first);
+    assert_eq!(cases.get(1).unwrap().caller, second);
+    assert!(
+        cases.get(0).unwrap().resolved_by.is_none(),
+        "an open case must not have resolution metadata"
+    );
+    assert!(cases.get(0).unwrap().resolved_at_ledger.is_none());
+    assert!(cases.get(0).unwrap().resolution_reason.is_none());
+    assert!(
+        client.get_arbitration_case(&third, &course_id).is_none(),
+        "students who did not escalate must not appear in the index"
+    );
+
+    // Resolving a case must not remove it from the append-only history.
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &first,
+        &course_id,
+        &true,
+        &String::from_str(&env, "STUDENT_WON"),
+    );
+
+    let cases_after_resolution = client.get_arbitration_cases_by_course(&course_id);
+    assert_eq!(cases_after_resolution.len(), 2);
+    assert_eq!(
+        cases_after_resolution.get(0).unwrap().status,
+        DisputeStatus::ResolvedForStudent
+    );
+    assert_eq!(
+        cases_after_resolution.get(1).unwrap().status,
+        DisputeStatus::Open
+    );
+
+    // Re-escalating after a resolution overwrites the same case record, so
+    // the index must not append a duplicate caller entry.
+    client.escalate_to_arbitration(&first, &course_id);
+    let cases_after_reescalation = client.get_arbitration_cases_by_course(&course_id);
+    assert_eq!(cases_after_reescalation.len(), 2);
+    assert_eq!(
+        cases_after_reescalation.get(0).unwrap().status,
+        DisputeStatus::Open
+    );
+}
+
+/// A student's disputes across all courses must be enumerable via the
+/// per-student index.
+#[test]
+fn test_arbitration_cases_indexed_by_student() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_arbitration_fee_config(&admin, &5_000_000);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-STUDENT-A",
+        1_000_000_000,
+    );
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-STUDENT-B",
+        1_000_000_000,
+    );
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+    client.enroll(&student, &String::from_str(&env, "COURSE-ARB-STUDENT-A"));
+    client.enroll(&student, &String::from_str(&env, "COURSE-ARB-STUDENT-B"));
+
+    client.escalate_to_arbitration(&student, &String::from_str(&env, "COURSE-ARB-STUDENT-A"));
+    client.escalate_to_arbitration(&student, &String::from_str(&env, "COURSE-ARB-STUDENT-B"));
+
+    let cases = client.get_arbitration_cases_by_student(&student);
+    assert_eq!(cases.len(), 2, "both of the student's disputes must be indexed");
+    assert_eq!(
+        cases.get(0).unwrap().course_id,
+        String::from_str(&env, "COURSE-ARB-STUDENT-A")
+    );
+    assert_eq!(
+        cases.get(1).unwrap().course_id,
+        String::from_str(&env, "COURSE-ARB-STUDENT-B")
+    );
+
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.get_arbitration_cases_by_student(&stranger).len(),
+        0,
+        "a student with no disputes must return an empty list"
+    );
+}
+
 /// #256 — resolve_arbitration() with for_student=true must refund the fee to the caller.
 #[test]
 fn test_resolve_arbitration_refund_to_student() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
 
     let fee_per_case = 5_000_000i128;
@@ -10869,7 +11020,14 @@ fn test_resolve_arbitration_refund_to_student() {
 
     let balance_before = token::Client::new(&env, &token_id).balance(&student);
     env.mock_all_auths_allowing_non_root_auth();
-    client.resolve_arbitration(&admin, &student, &course_id, &true);
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &true,
+        &String::from_str(&env, "STUDENT_WON"),
+    );
     let balance_after = token::Client::new(&env, &token_id).balance(&student);
 
     assert_eq!(
@@ -10880,12 +11038,18 @@ fn test_resolve_arbitration_refund_to_student() {
 
     let case = client.get_arbitration_case(&student, &course_id).unwrap();
     assert_eq!(case.status, DisputeStatus::ResolvedForStudent);
+    assert_eq!(case.resolved_by, Some(admin));
+    assert!(case.resolved_at_ledger.is_some());
+    assert_eq!(
+        case.resolution_reason,
+        Some(String::from_str(&env, "STUDENT_WON"))
+    );
 }
 
 /// #256 — resolve_arbitration() with for_student=false must pay the fee to the instructor.
 #[test]
 fn test_resolve_arbitration_payout_to_instructor() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
 
     let fee_per_case = 5_000_000i128;
@@ -10904,7 +11068,14 @@ fn test_resolve_arbitration_payout_to_instructor() {
 
     let instr_balance_before = token::Client::new(&env, &token_id).balance(&instructor);
     env.mock_all_auths_allowing_non_root_auth();
-    client.resolve_arbitration(&admin, &student, &course_id, &false);
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &false,
+        &String::from_str(&env, "INSTRUCTOR_WON"),
+    );
     let instr_balance_after = token::Client::new(&env, &token_id).balance(&instructor);
 
     assert_eq!(
@@ -10915,6 +11086,279 @@ fn test_resolve_arbitration_payout_to_instructor() {
 
     let case = client.get_arbitration_case(&student, &course_id).unwrap();
     assert_eq!(case.status, DisputeStatus::ResolvedForInstructor);
+    assert_eq!(case.resolved_by, Some(admin));
+    assert!(case.resolved_at_ledger.is_some());
+    assert_eq!(
+        case.resolution_reason,
+        Some(String::from_str(&env, "INSTRUCTOR_WON"))
+    );
+}
+
+/// A single admin must not be able to finalize a dispute unilaterally —
+/// resolution moves real funds and requires the SecondaryAdmin's co-signature.
+#[test]
+#[should_panic(expected = "unauthorized: requires both admin signatures")]
+fn test_resolve_arbitration_requires_secondary_admin_cosignature() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-COSIGN",
+        5_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-COSIGN");
+    client.escalate_to_arbitration(&student, &course_id);
+
+    // The second signer is not the configured SecondaryAdmin.
+    let not_secondary_admin = Address::generate(&env);
+    client.resolve_arbitration(
+        &admin,
+        &not_secondary_admin,
+        &student,
+        &course_id,
+        &true,
+        &String::from_str(&env, "STUDENT_WON"),
+    );
+}
+
+// ============================================================
+// FULL-LIFECYCLE DISPUTE INTEGRATION TESTS
+// ============================================================
+
+/// End-to-end dispute path: enroll, escalate (pay the arbitration fee), and
+/// resolve in the student's favour. Verifies the arbitration fee is refunded
+/// and that the instructor's enrollment earnings and treasury's platform fee
+/// remain untouched.
+#[test]
+fn test_full_lifecycle_dispute_resolved_for_student() {
+    let (env, contract_id, token_id, admin, sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let student_initial_balance = 100_000_000_000i128;
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &student_initial_balance);
+
+    let course_price = 500_000_000i128;
+    let arbitration_fee = 5_000_000i128;
+    let course_id_str = "COURSE-DISPUTE-STUDENT";
+    let course_id = String::from_str(&env, course_id_str);
+
+    client.set_arbitration_fee_config(&admin, &arbitration_fee);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        course_price,
+    );
+
+    // Enroll: the 20% platform fee goes to treasury immediately, while the
+    // instructor's 80% share is credited to pull-based earnings.
+    client.enroll(&student, &course_id);
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .expect("enrollment must exist");
+    let platform_amount = course_price * 20 / 100;
+    let instructor_amount = course_price - platform_amount;
+    assert_eq!(enrollment.platform_amount, platform_amount);
+    assert_eq!(enrollment.instructor_amount, instructor_amount);
+
+    let token_client = token::Client::new(&env, &token_id);
+    assert_eq!(
+        token_client.balance(&student),
+        student_initial_balance - course_price
+    );
+    assert_eq!(token_client.balance(&treasury), platform_amount);
+    assert_eq!(token_client.balance(&instructor), 0);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        instructor_amount
+    );
+    assert_eq!(token_client.balance(&contract_id), instructor_amount);
+
+    // Escalate: the student pays the arbitration fee into the contract.
+    client.escalate_to_arbitration(&student, &course_id);
+    assert_eq!(
+        token_client.balance(&student),
+        student_initial_balance - course_price - arbitration_fee
+    );
+    assert_eq!(
+        token_client.balance(&contract_id),
+        instructor_amount + arbitration_fee
+    );
+
+    // Resolve for the student: the fee is refunded from the contract.
+    let reason = String::from_str(&env, "COURSE_NOT_DELIVERED");
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &true,
+        &reason,
+    );
+
+    // Final balances: student made whole on the fee, instructor earnings and
+    // treasury revenue are unchanged by the dispute outcome.
+    assert_eq!(
+        token_client.balance(&student),
+        student_initial_balance - course_price,
+        "student must be refunded the arbitration fee"
+    );
+    assert_eq!(
+        token_client.balance(&instructor),
+        0,
+        "instructor's wallet must not receive the dispute fee on a student win"
+    );
+    assert_eq!(
+        token_client.balance(&treasury),
+        platform_amount,
+        "treasury's platform fee must be unaffected by arbitration"
+    );
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        instructor_amount,
+        "instructor earnings from enrollment must remain intact"
+    );
+    assert_eq!(
+        token_client.balance(&contract_id),
+        instructor_amount,
+        "the contract must only retain the instructor's unwithdrawn earnings"
+    );
+
+    let case = client
+        .get_arbitration_case(&student, &course_id)
+        .expect("resolved case must remain retrievable");
+    assert_eq!(case.status, DisputeStatus::ResolvedForStudent);
+    assert_eq!(case.fee_paid, arbitration_fee);
+    assert_eq!(case.resolved_by, Some(admin));
+    assert_eq!(case.resolved_at_ledger, Some(env.ledger().sequence()));
+    assert_eq!(case.resolution_reason, Some(reason));
+
+    let course_cases = client.get_arbitration_cases_by_course(&course_id);
+    assert_eq!(course_cases.len(), 1);
+    assert_eq!(course_cases.get(0).unwrap().caller, student);
+}
+
+/// End-to-end dispute path resolved in the instructor's favour: the student
+/// forgoes the arbitration fee, the instructor receives it directly, and the
+/// platform fee / instructor earnings from enrollment are unchanged.
+#[test]
+fn test_full_lifecycle_dispute_resolved_for_instructor() {
+    let (env, contract_id, token_id, admin, sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let student_initial_balance = 100_000_000_000i128;
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &student_initial_balance);
+
+    let course_price = 500_000_000i128;
+    let arbitration_fee = 5_000_000i128;
+    let course_id_str = "COURSE-DISPUTE-INSTRUCTOR";
+    let course_id = String::from_str(&env, course_id_str);
+
+    client.set_arbitration_fee_config(&admin, &arbitration_fee);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        course_price,
+    );
+
+    client.enroll(&student, &course_id);
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .expect("enrollment must exist");
+    let platform_amount = course_price * 20 / 100;
+    let instructor_amount = course_price - platform_amount;
+    assert_eq!(enrollment.platform_amount, platform_amount);
+    assert_eq!(enrollment.instructor_amount, instructor_amount);
+
+    let token_client = token::Client::new(&env, &token_id);
+    assert_eq!(
+        token_client.balance(&student),
+        student_initial_balance - course_price
+    );
+    assert_eq!(token_client.balance(&treasury), platform_amount);
+    assert_eq!(token_client.balance(&instructor), 0);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        instructor_amount
+    );
+    assert_eq!(token_client.balance(&contract_id), instructor_amount);
+
+    // Escalate: the student pays the arbitration fee into the contract.
+    client.escalate_to_arbitration(&student, &course_id);
+    assert_eq!(
+        token_client.balance(&student),
+        student_initial_balance - course_price - arbitration_fee
+    );
+    assert_eq!(
+        token_client.balance(&contract_id),
+        instructor_amount + arbitration_fee
+    );
+
+    // Resolve for the instructor: the fee is paid out of the contract.
+    let reason = String::from_str(&env, "STUDENT_CLAIM_NOT_SUBSTANTIATED");
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &false,
+        &reason,
+    );
+
+    // Final balances: the student's fee is forfeited to the instructor; the
+    // enrollment split itself is untouched.
+    assert_eq!(
+        token_client.balance(&student),
+        student_initial_balance - course_price - arbitration_fee,
+        "student must not be refunded on an instructor-win resolution"
+    );
+    assert_eq!(
+        token_client.balance(&instructor),
+        arbitration_fee,
+        "instructor must receive the full arbitration fee"
+    );
+    assert_eq!(
+        token_client.balance(&treasury),
+        platform_amount,
+        "treasury's platform fee must be unaffected by arbitration"
+    );
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        instructor_amount,
+        "instructor earnings from enrollment must remain intact"
+    );
+    assert_eq!(
+        token_client.balance(&contract_id),
+        instructor_amount,
+        "the contract must only retain the instructor's unwithdrawn earnings"
+    );
+
+    let case = client
+        .get_arbitration_case(&student, &course_id)
+        .expect("resolved case must remain retrievable");
+    assert_eq!(case.status, DisputeStatus::ResolvedForInstructor);
+    assert_eq!(case.fee_paid, arbitration_fee);
+    assert_eq!(case.resolved_by, Some(admin));
+    assert_eq!(case.resolved_at_ledger, Some(env.ledger().sequence()));
+    assert_eq!(case.resolution_reason, Some(reason));
+
+    let student_cases = client.get_arbitration_cases_by_student(&student);
+    assert_eq!(student_cases.len(), 1);
+    assert_eq!(student_cases.get(0).unwrap().course_id, course_id);
 }
 
 /// Escalation is not student-only: a course instructor can open a case through
