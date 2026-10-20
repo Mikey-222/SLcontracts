@@ -45,6 +45,7 @@ This is **Repo 1 of 3** in the SorobanLard project:
 
 - [What the Contract Does](#what-the-contract-does)
 - [What Lives Off-Chain](#what-lives-off-chain)
+- [Storage Tiers](#storage-tiers)
 - [Architecture](#architecture)
 - [Data Structures](#data-structures)
 - [Contract Functions](#contract-functions)
@@ -96,6 +97,21 @@ The contract intentionally stores only what is necessary for payments and verifi
 | Instructor analytics | — |
 
 This keeps the contract small, cheap to call, and focused on what blockchains are actually good at: verifiable ownership, trustless payments, and permanent records.
+
+---
+
+## Storage Tiers
+
+The contract uses Soroban **instance** storage for singleton config, auth flags,
+and global counters, and **persistent** storage for per-entity records and
+append-only collections. The rule of thumb for new keys is:
+
+> Singleton config / auth flag / global counter → instance.
+> Per-course / per-student / per-instructor record or list → persistent.
+
+Every current `DataKey` / `DataKey2` variant is classified in
+[docs/storage-keys.md](docs/storage-keys.md), along with the rationale and the
+race-freedom argument for `TotalActiveEnrollments`.
 
 ---
 
@@ -177,11 +193,18 @@ pub struct Certificate {
 ### `CourseStatus` state machine
 
 ```
-Pending ── approve_course() ──→ Active
-Active  ── pause_course()   ──→ Paused
-Paused  ── unpause_course() ──→ Active
-Active  ── archive_course() ──→ Archived (admin only, permanent)
+Pending ── approve_course()  ──→ Active
+Pending ── reject_course()   ──→ Rejected (terminal)
+Active  ── pause_course() / freeze_instructor() ──→ Paused
+Paused  ── unpause_course()  ──→ Active
+Paused  ── archive_course()  ──→ Archived (both admins, no active enrollments, terminal)
 ```
+
+The full transition tables for `CourseStatus` and the `Enrollment` lifecycle
+(active, completed, certificate issued, refunded, archived to history,
+expired), with every function that triggers each transition, are in
+[STATE_MACHINES.md](STATE_MACHINES.md). The accounting and state invariants
+those transitions must preserve are listed in [INVARIANTS.md](INVARIANTS.md).
 
 ---
 
@@ -291,6 +314,9 @@ Returns `true` if the certificate exists and has not been revoked. The `get_cert
 | `certificate_revoked` | `certificate_id` | Certificate revoked |
 | `course_certificates_revoked` | `(admin, course_id, revoked_count, ledger)` | All certificates of a course bulk-revoked |
 | `admin_transferred` | `new_admin` | Admin role transferred |
+| `dispute_escalated` | `(caller, course_id, fee)` | Arbitration case opened |
+| `arbitration_resolved` | `(caller, course_id, for_student, admin)` | Admin resolved an open case |
+| `arbitration_auto_refunded` | `(caller, course_id, fee, ledger)` | Case timed out; fee refunded to the escalating caller |
 
 The backend listens to these events and updates the database, sends notifications, and triggers email confirmations.
 
@@ -437,7 +463,8 @@ stellar contract invoke \
 
 - **Authorization**: Every write function calls `require_auth()` on the relevant party. Instructors cannot approve their own courses. Students cannot issue their own certificates. Only the admin can revoke certificates.
 - **No double enrollment**: The contract checks for an existing enrollment record before processing payment. A student cannot be charged twice for the same course.
-- **Atomic payment split**: Both the platform and instructor transfers happen in the same transaction. There is no intermediate escrow that could be exploited.
+- **Atomic payment split**: The student → contract payment, the contract → treasury platform fee and the instructor earnings credit all happen in the same invocation. If any step fails, including the treasury transfer after the student's payment has landed, the whole invocation reverts: no enrollment, earnings credit or `total_earned` change is kept. This is verified by `test_enroll_rolls_back_when_second_split_transfer_fails`.
+- **Token assumptions**: Approved tokens must be standard, fee-free, non-rebasing SAC-style tokens. Instructor earnings are a plain stroops counter that only matches the contract's real balance under that assumption. Fee-on-transfer tokens are rejected at enrollment, but withdrawals and refunds trust the token to deliver the full amount. See `add_approved_token` and [INVARIANTS.md](INVARIANTS.md).
 - **Certificate immutability**: Revoked certificates are flagged — not deleted. This preserves the audit trail and prevents a revocation from being hidden.
 - **Admin is a single address**: For production, consider using a multi-sig wallet as the admin address to avoid a single point of failure.
 - **Fee validation**: Platform fee percentage is validated to be ≤ 100 at both `init` and `register_course` time.

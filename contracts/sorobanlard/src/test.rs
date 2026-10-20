@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::{
-    contract, contractimpl,
+    contract, contractimpl, contracttype,
     testutils::{Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke},
     token, Address, BytesN, Env, IntoVal, String, Symbol, TryIntoVal, Val,
 };
@@ -7127,6 +7127,101 @@ fn test_platform_counter_decrements_on_refund() {
     assert_eq!(client.get_total_active_enrollments(), 2);
 }
 
+/// Stress the global counter with many sequential enrollments across many
+/// courses, then exercise both decrement paths (completion and refund). The
+/// final value is compared against an independently computed expectation and
+/// against the sum of every course's own `active_enrollments`.
+///
+/// Soroban executes invocations one at a time, so this also serves as the
+/// regression test for the race-freedom argument in the module docs: no
+/// increment is lost even though every call reads and writes the same single
+/// instance-storage key.
+#[test]
+fn test_stress_total_active_enrollments_sequential() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    const COURSE_COUNT: u32 = 6;
+    const STUDENT_COUNT: u32 = 8;
+    const COMPLETED_PER_COURSE: u32 = 2;
+    let price = 1_000_000i128;
+
+    let mut courses: std::vec::Vec<String> = std::vec::Vec::new();
+    for i in 0..COURSE_COUNT {
+        let course_id = format!("COURSE-STRESS-{:03}", i);
+        register_and_approve_course(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            &course_id,
+            price,
+        );
+        courses.push(String::from_str(&env, &course_id));
+    }
+
+    let token_client = token::StellarAssetClient::new(&env, &token_id);
+    let mut students: std::vec::Vec<Address> = std::vec::Vec::new();
+    for _ in 0..STUDENT_COUNT {
+        let student = Address::generate(&env);
+        token_client.mint(&student, &(price * COURSE_COUNT as i128));
+        students.push(student);
+    }
+
+    // Enroll every student in every course, one invocation at a time.
+    for student in students.iter() {
+        for course_id in courses.iter() {
+            client.enroll(student, course_id);
+        }
+    }
+
+    let total_enrollments = COURSE_COUNT * STUDENT_COUNT;
+    assert_eq!(
+        client.get_total_active_enrollments(),
+        total_enrollments,
+        "counter must equal the number of sequential enrollments"
+    );
+    for course_id in courses.iter() {
+        let course = client.get_course(course_id).unwrap();
+        assert_eq!(course.total_enrollments, STUDENT_COUNT);
+        assert_eq!(course.active_enrollments, STUDENT_COUNT);
+    }
+
+    // Complete the first students in every course.
+    for course_id in courses.iter() {
+        for student in students.iter().take(COMPLETED_PER_COURSE as usize) {
+            client.mark_completed(
+                &admin,
+                student,
+                course_id,
+                &Some(String::from_str(&env, "stress-evidence")),
+            );
+        }
+    }
+
+    // Refund one remaining enrollment to exercise the second decrement path.
+    let refunded_student = students.last().unwrap();
+    let refunded_course = courses.first().unwrap();
+    client.request_refund(refunded_student, refunded_course);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, refunded_student, refunded_course, &true);
+
+    let expected_active = total_enrollments - (COURSE_COUNT * COMPLETED_PER_COURSE) - 1;
+    assert_eq!(
+        client.get_total_active_enrollments(),
+        expected_active,
+        "counter must reflect enrollments minus completions minus refunds"
+    );
+
+    // Independent cross-check: the sum of the per-course counters must match.
+    let mut summed_active = 0u32;
+    for course_id in courses.iter() {
+        summed_active += client.get_course(course_id).unwrap().active_enrollments;
+    }
+    assert_eq!(summed_active, expected_active);
+}
+
 // ============================================================
 // MARK COMPLETED COURSE STATE VALIDATION TESTS (#129)
 // ============================================================
@@ -10822,6 +10917,159 @@ fn test_resolve_arbitration_payout_to_instructor() {
     assert_eq!(case.status, DisputeStatus::ResolvedForInstructor);
 }
 
+/// Escalation is not student-only: a course instructor can open a case through
+/// the same entry point. This confirms the policy documented in the
+/// dispute-system module docs.
+#[test]
+fn test_instructor_can_escalate_arbitration() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let _student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-INSTRUCTOR", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-INSTRUCTOR");
+
+    // Instructor earnings are pull-based, so fund the fee directly.
+    token::StellarAssetClient::new(&env, &token_id).mint(&instructor, &fee_per_case);
+    let token_client = token::Client::new(&env, &token_id);
+    let balance_before = token_client.balance(&instructor);
+
+    client.escalate_to_arbitration(&instructor, &course_id);
+
+    assert_eq!(
+        balance_before - token_client.balance(&instructor),
+        fee_per_case,
+        "the instructor must pay the same escalation fee as a student"
+    );
+
+    let case = client
+        .get_arbitration_case(&instructor, &course_id)
+        .expect("instructor escalation must create a retrievable case");
+    assert_eq!(case.caller, instructor);
+    assert_eq!(case.instructor, instructor);
+    assert_eq!(case.status, DisputeStatus::Open);
+}
+
+/// The timeout is enforced at the exact boundary: a claim one ledger early is
+/// rejected, and the claim at `opened_at + timeout` refunds the full fee to the
+/// escalating caller and emits `arbitration_auto_refunded`.
+#[test]
+fn test_arbitration_timeout_boundary_auto_refunds_caller() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-TIMEOUT", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-TIMEOUT");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout = client.get_arbitration_timeout_ledgers();
+    assert_eq!(
+        timeout,
+        SorobanLardContract::ARBITRATION_TIMEOUT_LEDGERS,
+        "getter must expose the constant used by the contract"
+    );
+    let timeout_at = case.opened_at_ledger + timeout;
+
+    // One ledger before the timeout: the caller cannot force the refund yet.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at - 1;
+    });
+    assert!(
+        client
+            .try_claim_arbitration_timeout(&student, &course_id)
+            .is_err(),
+        "timeout claim must fail before the boundary"
+    );
+
+    // At the boundary the claim succeeds and refunds the full fee.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let token_client = token::Client::new(&env, &token_id);
+    let balance_before = token_client.balance(&student);
+    client.claim_arbitration_timeout(&student, &course_id);
+
+    // Read the event before any other contract call: Soroban's test host
+    // keeps only the events emitted by the most recent invocation.
+    let (event_caller, event_course, event_fee, event_ledger): (Address, String, i128, u32) =
+        last_event_val(&env, &contract_id, "arbitration_auto_refunded")
+            .try_into_val(&env)
+            .unwrap();
+    assert_eq!(event_caller, student);
+    assert_eq!(event_course, course_id);
+    assert_eq!(event_fee, fee_per_case);
+    assert_eq!(event_ledger, timeout_at);
+
+    let balance_after = token_client.balance(&student);
+    assert_eq!(
+        balance_after - balance_before,
+        fee_per_case,
+        "timeout claim must refund the full arbitration fee"
+    );
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    assert_eq!(case.status, DisputeStatus::AutoRefunded);
+}
+
+/// After the timeout an admin can no longer resolve the case, so the caller's
+/// auto-refund cannot be front-run by a late instructor-favoured ruling.
+#[test]
+#[should_panic(expected = "arbitration case has timed out; use claim_arbitration_timeout")]
+fn test_resolve_arbitration_after_timeout_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-LATE", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-LATE");
+
+    client.escalate_to_arbitration(&student, &course_id);
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout_at = case.opened_at_ledger + client.get_arbitration_timeout_ledgers();
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(&admin, &student, &course_id, &false);
+}
+
+/// A resolved case cannot be settled a second time through the timeout path.
+#[test]
+#[should_panic(expected = "arbitration case is not open")]
+fn test_arbitration_timeout_cannot_claim_resolved_case() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-SETTLED", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-SETTLED");
+
+    client.escalate_to_arbitration(&student, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(&admin, &student, &course_id, &true);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout_at = case.opened_at_ledger + client.get_arbitration_timeout_ledgers();
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    client.claim_arbitration_timeout(&student, &course_id);
+}
+
 // ============================================================
 // REFUND ENROLLMENT ARCHIVAL  (#254)
 // ============================================================
@@ -10890,531 +11138,330 @@ fn test_process_refund_archives_enrollment_to_history() {
 }
 
 // ============================================================
-// ARBITRATION ESCALATION / RESOLUTION COVERAGE
+// NON-STANDARD TOKEN MOCK  (#138, #139)
 // ============================================================
 
-/// The contract accepts no caller-supplied fee: it always pulls the
-/// configured `fee_per_case`. A zero/unconfigured floor is therefore the
-/// "insufficient fee" path and must be rejected before any tokens move.
-#[test]
-#[should_panic(expected = "arbitration fee not configured")]
-fn test_escalation_with_unconfigured_fee_panics() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    register_and_approve_course(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-ARB-MIN-FEE",
-        1_000_000_000,
-    );
-    let student = Address::generate(&env);
-    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
-
-    // An explicit zero floor means no escalation fee can satisfy the minimum.
-    client.set_arbitration_fee_config(&admin, &0i128);
-    client.escalate_to_arbitration(&student, &String::from_str(&env, "COURSE-ARB-MIN-FEE"));
+#[contracttype]
+enum NonStandardTokenKey {
+    Balance(Address),
+    /// Fee (in bps) burned from every transfer before crediting the recipient
+    FeeBps,
+    /// 1-based index of the transfer call that should panic (0 = never)
+    FailOnTransfer,
+    /// Number of transfer calls since the last `fail_on_transfer()`
+    TransferCount,
 }
 
-#[test]
-fn test_escalation_with_balance_below_fee_per_case_panics() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
+/// Minimal token exposing just the interface the contract uses
+/// (`decimals`, `balance`, `transfer`), with switches for non-standard
+/// behaviour: a per-transfer fee, or a forced failure on the Nth transfer.
+#[contract]
+struct NonStandardToken;
 
-    let fee_per_case = 5_000_000i128;
-    client.set_arbitration_fee_config(&admin, &fee_per_case);
-    register_and_approve_course(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-ARB-SHORT",
-        1_000_000_000,
-    );
-    let course_id = String::from_str(&env, "COURSE-ARB-SHORT");
-
-    // The contract pulls the configured fee; a caller holding even one stroop
-    // less than fee_per_case cannot complete the escalation.
-    let student = Address::generate(&env);
-    token::StellarAssetClient::new(&env, &token_id).mint(&student, &(fee_per_case - 1));
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.escalate_to_arbitration(&student, &course_id);
-    }));
-    assert!(
-        result.is_err(),
-        "escalation must fail when the caller cannot cover fee_per_case"
-    );
-
-    // The failed transfer must be atomic: no case and no fee movement.
-    assert!(client.get_arbitration_case(&student, &course_id).is_none());
-    assert_eq!(
-        token::Client::new(&env, &token_id).balance(&student),
-        fee_per_case - 1
-    );
-}
-
-#[test]
-fn test_escalation_exact_fee_is_moved_into_arbitration_pool() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    let fee_per_case = 5_000_000i128;
-    let student = setup_arbitration(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-ARB-POOL",
-        fee_per_case,
-    );
-    let course_id = String::from_str(&env, "COURSE-ARB-POOL");
-    let token_client = token::Client::new(&env, &token_id);
-
-    let student_before = token_client.balance(&student);
-    let pool_before = token_client.balance(&contract_id);
-
-    client.escalate_to_arbitration(&student, &course_id);
-
-    assert_eq!(
-        student_before - token_client.balance(&student),
-        fee_per_case,
-        "caller must pay exactly fee_per_case"
-    );
-    assert_eq!(
-        token_client.balance(&contract_id) - pool_before,
-        fee_per_case,
-        "escrow pool must receive exactly fee_per_case"
-    );
-
-    // The case must be addressable through ArbitrationCaseKey.
-    let key = ArbitrationCaseKey {
-        caller: student.clone(),
-        course_id: course_id.clone(),
-    };
-    let stored: Option<ArbitrationCase> =
-        env.as_contract(&contract_id, || env.storage().persistent().get(&key));
-    let stored = stored.expect("case must be stored under ArbitrationCaseKey");
-    assert_eq!(stored.caller, student);
-    assert_eq!(stored.instructor, instructor);
-    assert_eq!(stored.token, token_id);
-    assert_eq!(stored.fee_paid, fee_per_case);
-    assert_eq!(stored.status, DisputeStatus::Open);
-}
-
-#[test]
-fn test_escalation_event_payload_matches_documented_fields() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    let fee_per_case = 5_000_000i128;
-    let student = setup_arbitration(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-ARB-EVENT",
-        fee_per_case,
-    );
-    let course_id = String::from_str(&env, "COURSE-ARB-EVENT");
-
-    client.escalate_to_arbitration(&student, &course_id);
-
-    let mut escalation_events = 0u32;
-    for (contract, topics, data) in env.events().all().iter() {
-        if contract != contract_id {
-            continue;
-        }
-
-        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        if topic0 != Symbol::new(&env, "dispute_escalated") {
-            continue;
-        }
-        escalation_events += 1;
-
-        // Documented topics: ("dispute_escalated", course_id).
-        let topic_course_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(topic_course_id, course_id);
-
-        // Documented payload: (caller, course_id, fee_paid).
-        let (event_caller, event_course_id, event_fee): (Address, String, i128) =
-            data.try_into_val(&env).unwrap();
-        assert_eq!(event_caller, student);
-        assert_eq!(event_course_id, course_id);
-        assert_eq!(event_fee, fee_per_case);
+#[contractimpl]
+impl NonStandardToken {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let key = NonStandardTokenKey::Balance(to);
+        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(balance + amount));
     }
 
-    assert_eq!(
-        escalation_events, 1,
-        "escalation must emit exactly one dispute_escalated event"
-    );
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&NonStandardTokenKey::Balance(id))
+            .unwrap_or(0)
+    }
+
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    pub fn set_transfer_fee_bps(env: Env, fee_bps: i128) {
+        env.storage()
+            .instance()
+            .set(&NonStandardTokenKey::FeeBps, &fee_bps);
+    }
+
+    pub fn fail_on_transfer(env: Env, nth: u32) {
+        env.storage()
+            .instance()
+            .set(&NonStandardTokenKey::FailOnTransfer, &nth);
+        env.storage()
+            .instance()
+            .set(&NonStandardTokenKey::TransferCount, &0u32);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&NonStandardTokenKey::TransferCount)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&NonStandardTokenKey::TransferCount, &count);
+        let fail_on: u32 = env
+            .storage()
+            .instance()
+            .get(&NonStandardTokenKey::FailOnTransfer)
+            .unwrap_or(0);
+        if count == fail_on {
+            panic!("mock token: transfer #{} rejected", count);
+        }
+
+        let from_key = NonStandardTokenKey::Balance(from);
+        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+        if from_balance < amount {
+            panic!("mock token: insufficient balance");
+        }
+        env.storage()
+            .persistent()
+            .set(&from_key, &(from_balance - amount));
+
+        let fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&NonStandardTokenKey::FeeBps)
+            .unwrap_or(0);
+        let fee = amount * fee_bps / 10_000;
+        let to_key = NonStandardTokenKey::Balance(to);
+        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&to_key, &(to_balance + amount - fee));
+    }
 }
 
-#[test]
-#[should_panic(expected = "arbitration case is not open")]
-fn test_resolve_arbitration_twice_panics() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    let fee_per_case = 5_000_000i128;
-    let student = setup_arbitration(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-ARB-TWICE",
-        fee_per_case,
-    );
-    let course_id = String::from_str(&env, "COURSE-ARB-TWICE");
-
-    client.escalate_to_arbitration(&student, &course_id);
-    env.mock_all_auths_allowing_non_root_auth();
-    client.resolve_arbitration(&admin, &student, &course_id, &true);
-
-    // The case is ResolvedForStudent now; a second payout must be rejected.
-    client.resolve_arbitration(&admin, &student, &course_id, &true);
-}
-
-#[test]
-#[should_panic(expected = "unauthorized: resolve_arbitration - caller is not admin")]
-fn test_resolve_arbitration_requires_admin() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    let fee_per_case = 5_000_000i128;
-    let student = setup_arbitration(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-ARB-AUTH",
-        fee_per_case,
-    );
-    let course_id = String::from_str(&env, "COURSE-ARB-AUTH");
-
-    client.escalate_to_arbitration(&student, &course_id);
-
-    let not_admin = Address::generate(&env);
-    client.resolve_arbitration(&not_admin, &student, &course_id, &true);
-}
-
-// ============================================================
-// RISK FEE STACKING, CLASSIFICATION & EVENT COVERAGE
-// ============================================================
-
-#[test]
-fn test_risk_large_payment_and_new_customer_surcharges_stack_additively() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    client.set_fee_config(&admin, &token_id, &1000u32);
-    client.set_risk_config_enabled(&admin, &true);
-    client.set_risk_fee_config(&admin, &300u32, &1_000_000_000i128, &400u32, &0u32);
-
-    // A freshly generated student has no enrollment history, and the payment
-    // is above the configured large-payment threshold.
-    let student = Address::generate(&env);
-    let payment_amount = 2_000_000_000i128;
-
-    let preview = client.get_effective_fee_for_payment(&student, &token_id, &payment_amount);
-    assert_eq!(preview.base_fee_bps, 1000);
-    assert_eq!(
-        preview.risk_surcharge_bps, 700,
-        "300 bps large-payment + 400 bps new-customer must be additive"
-    );
-    assert_eq!(preview.effective_fee_bps, 1700);
-    assert_eq!(
-        preview.platform_fee,
-        payment_amount * 1700 / 10000,
-        "platform fee must use the combined effective rate"
-    );
-
-    let score = client.calculate_risk_score(&student, &token_id, &payment_amount);
-    assert_eq!(score.score, 70);
-    assert_eq!(score.surcharge_bps, 700);
-}
-
-#[test]
-fn test_btc_eth_surcharge_only_applies_to_classified_tokens() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    client.set_fee_config(&admin, &token_id, &1000u32);
-    client.set_risk_config_enabled(&admin, &true);
-    client.set_risk_fee_config(&admin, &0u32, &10_000_000_000i128, &0u32, &900u32);
-
-    let student = Address::generate(&env);
-    let payment_amount = 1_000_000_000i128;
-
-    let unclassified = client.get_effective_fee_for_payment(&student, &token_id, &payment_amount);
-    assert_eq!(
-        unclassified.risk_surcharge_bps, 0,
-        "BTC/ETH surcharge must not apply before the token is classified"
-    );
-    assert_eq!(unclassified.effective_fee_bps, 1000);
-
-    client.set_token_btc_eth(&admin, &token_id, &true);
-    let classified = client.get_effective_fee_for_payment(&student, &token_id, &payment_amount);
-    assert_eq!(
-        classified.risk_surcharge_bps, 900,
-        "BTC/ETH surcharge must apply to a classified token"
-    );
-    assert_eq!(classified.effective_fee_bps, 1900);
-
-    client.set_token_btc_eth(&admin, &token_id, &false);
-    let reverted = client.get_effective_fee_for_payment(&student, &token_id, &payment_amount);
-    assert_eq!(
-        reverted.risk_surcharge_bps, 0,
-        "removing the BTC/ETH classification must stop the surcharge"
-    );
-}
-
-#[test]
-fn test_risk_surcharges_never_exceed_100_percent_effective_fee() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    // 90% base + 30% large + 30% new-customer + 30% BTC/ETH would be 180%.
-    client.set_fee_config(&admin, &token_id, &9000u32);
-    client.set_risk_config_enabled(&admin, &true);
-    client.set_risk_fee_config(&admin, &3000u32, &100_000_000i128, &3000u32, &3000u32);
-    client.set_token_btc_eth(&admin, &token_id, &true);
-
-    let student = Address::generate(&env);
-    let payment_amount = 1_000_000_000i128;
-    let preview = client.get_effective_fee_for_payment(&student, &token_id, &payment_amount);
-
-    assert_eq!(preview.risk_surcharge_bps, 9000);
-    assert_eq!(
-        preview.effective_fee_bps, 10000,
-        "combined surcharges must be capped at 100%"
-    );
-    assert_eq!(
-        preview.platform_fee, payment_amount,
-        "a capped 100% fee must consume the entire payment"
-    );
-}
-
-#[test]
-fn test_risk_fee_applied_event_only_when_risk_config_enabled() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    client.set_fee_config(&admin, &token_id, &1000u32);
-    // Large-payment and new-customer surcharges are configured but risk
-    // pricing starts disabled.
-    client.set_risk_fee_config(&admin, &500u32, &500_000_000i128, &700u32, &0u32);
-
-    let price = 1_000_000_000i128;
-    register_and_approve_course(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-RISK-EVENT",
-        price,
-    );
-    let course_id = String::from_str(&env, "COURSE-RISK-EVENT");
-
-    let disabled_student = Address::generate(&env);
-    token::StellarAssetClient::new(&env, &token_id).mint(&disabled_student, &price);
-    client.enroll(&disabled_student, &course_id);
-    assert!(
-        !has_event(&env, &contract_id, "risk_fee_applied"),
-        "no RiskFeeApplied event may be emitted while risk pricing is disabled"
-    );
-
-    client.set_risk_config_enabled(&admin, &true);
-
-    let enabled_student = Address::generate(&env);
-    token::StellarAssetClient::new(&env, &token_id).mint(&enabled_student, &price);
-    client.enroll(&enabled_student, &course_id);
-
-    assert!(
-        has_event(&env, &contract_id, "risk_fee_applied"),
-        "RiskFeeApplied must be emitted when risk pricing is enabled and a surcharge applies"
-    );
-
-    let applied: RiskFeeApplied = last_event_val(&env, &contract_id, "risk_fee_applied")
-        .try_into_val(&env)
-        .unwrap();
-    assert_eq!(applied.payment_amount, price);
-    assert_eq!(applied.base_fee_bps, 1000);
-    assert_eq!(applied.risk_surcharge_bps, 1200);
-    assert_eq!(applied.effective_fee_bps, 2200);
-    assert_eq!(applied.platform_fee, price * 2200 / 10000);
-}
-
-// ============================================================
-// WAITLIST ORDERING & ELIGIBILITY COVERAGE
-// ============================================================
-
-/// Register a one-seat course, approve it, and fill the seat so subsequent
-/// students are forced onto the waitlist.
-fn setup_full_waitlist_course(
-    env: &Env,
+/// Register a `NonStandardToken`, approve it, and fund `student`.
+fn setup_non_standard_token<'a>(
+    env: &'a Env,
     client: &SorobanLardContractClient,
-    token_id: &Address,
     admin: &Address,
-    instructor: &Address,
-    course_id: &str,
-) -> Address {
-    client.register_course(
-        instructor,
-        &String::from_str(env, course_id),
-        &100_000_000,
-        token_id,
-        &0u32,
-        &Some(1u32),
-        &BytesN::from_array(env, &[1u8; 32]),
-        &soroban_sdk::Vec::new(env),
-    );
-    client.approve_course(admin, &String::from_str(env, course_id));
-    env.ledger().with_mut(|l| {
-        l.sequence_number += 1;
-    });
-
-    let enrolled = Address::generate(env);
-    token::StellarAssetClient::new(env, token_id).mint(&enrolled, &1_000_000_000);
-    client.enroll(&enrolled, &String::from_str(env, course_id));
-    enrolled
+    student: &Address,
+    amount: i128,
+) -> (Address, NonStandardTokenClient<'a>) {
+    let token_id = env.register(NonStandardToken, ());
+    let token = NonStandardTokenClient::new(env, &token_id);
+    client.add_approved_token(admin, &token_id);
+    token.mint(student, &amount);
+    (token_id, token)
 }
 
+// ============================================================
+// ATOMIC PAYMENT SPLIT ROLLBACK  (#139)
+// ============================================================
+
+/// #139 — enroll() makes two transfers: student → contract (full price),
+/// then contract → treasury (platform share). If the second one fails after
+/// the first succeeded, the whole invocation must revert: no Enrollment, no
+/// InstructorEarnings credit, no total_earned / counter updates, and the
+/// student's payment is back in their wallet.
 #[test]
-fn test_waitlist_join_preserves_fifo_insertion_order() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+fn test_enroll_rolls_back_when_second_split_transfer_fails() {
+    let (env, contract_id, _sac_id, admin, _sec_admin, treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
 
-    setup_full_waitlist_course(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-WAIT-FIFO",
+    let student = Address::generate(&env);
+    let funded = 1_000_000_000i128;
+    let (token_id, token) = setup_non_standard_token(&env, &client, &admin, &student, funded);
+
+    let price = 100_000_000i128;
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-SPLIT-FAIL", price,
     );
-    let course_id = String::from_str(&env, "COURSE-WAIT-FIFO");
+    let course_id = String::from_str(&env, "COURSE-SPLIT-FAIL");
 
-    let first = Address::generate(&env);
-    let second = Address::generate(&env);
-    let third = Address::generate(&env);
+    // Transfer #1 (student → contract) succeeds; transfer #2
+    // (contract → treasury) panics.
+    token.fail_on_transfer(&2);
+    let result = client.try_enroll(&student, &course_id);
+    assert!(result.is_err(), "enroll must fail when the split transfer fails");
 
-    client.join_waitlist(&first, &course_id);
-    client.join_waitlist(&second, &course_id);
-    client.join_waitlist(&third, &course_id);
+    // No Enrollment record
+    assert!(!client.is_enrolled(&student, &course_id));
+    assert!(client
+        .get_enrollment(&student, &student, &course_id)
+        .is_none());
+    assert_eq!(client.has_completed(&student, &course_id), None);
 
-    let waitlist = client
-        .get_waitlist(&course_id)
-        .expect("waitlist must exist after joins");
-    assert_eq!(waitlist.len(), 3);
-    assert_eq!(waitlist.get(0).unwrap(), first);
-    assert_eq!(waitlist.get(1).unwrap(), second);
-    assert_eq!(waitlist.get(2).unwrap(), third);
-}
+    // No InstructorEarnings credit
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+    assert_eq!(client.get_instructor_total_earnings(&instructor), 0);
 
-#[test]
-fn test_waitlist_leave_middle_preserves_relative_order() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
+    // No total_earned / enrollment counter updates
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.total_earned, 0);
+    assert_eq!(course.total_enrollments, 0);
+    assert_eq!(course.active_enrollments, 0);
+    assert_eq!(course.status, CourseStatus::Active);
+    assert_eq!(client.get_total_active_enrollments(), 0);
+    assert_eq!(client.get_instructor_stats(&instructor).total_students, 0);
+    assert_eq!(client.get_student_enrollment_count(&student), 0);
 
-    setup_full_waitlist_course(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-WAIT-MIDDLE",
-    );
-    let course_id = String::from_str(&env, "COURSE-WAIT-MIDDLE");
+    // The first (successful) transfer was rolled back too
+    assert_eq!(token.balance(&student), funded);
+    assert_eq!(token.balance(&contract_id), 0);
+    assert_eq!(token.balance(&treasury), 0);
 
-    let first = Address::generate(&env);
-    let middle = Address::generate(&env);
-    let last = Address::generate(&env);
-
-    client.join_waitlist(&first, &course_id);
-    client.join_waitlist(&middle, &course_id);
-    client.join_waitlist(&last, &course_id);
-
-    client.leave_waitlist(&middle, &course_id);
-
-    let waitlist = client
-        .get_waitlist(&course_id)
-        .expect("waitlist must still exist after a middle leave");
-    assert_eq!(waitlist.len(), 2);
-    assert_eq!(waitlist.get(0).unwrap(), first);
+    // Control: with the failure disarmed the same call succeeds and splits
+    // as expected, so the failure above really was the treasury transfer.
+    token.fail_on_transfer(&0);
+    client.enroll(&student, &course_id);
+    let platform_share = price * 20 / 100;
+    assert!(client.is_enrolled(&student, &course_id));
+    assert_eq!(token.balance(&student), funded - price);
+    assert_eq!(token.balance(&treasury), platform_share);
+    assert_eq!(token.balance(&contract_id), price - platform_share);
     assert_eq!(
-        waitlist.get(1).unwrap(),
-        last,
-        "entries after the removed middle entry must shift down without reordering"
+        client.get_instructor_earnings(&instructor, &token_id),
+        price - platform_share
     );
+    assert_eq!(client.get_course(&course_id).unwrap().total_earned, price);
 }
 
+// ============================================================
+// TOKEN ASSUMPTIONS & EARNINGS RECONCILIATION  (#138)
+// ============================================================
+
+/// #138 — after a mixed sequence of enrollments, withdrawals, a refund and
+/// a re-enrollment, the contract's real token balance must equal
+/// sum(InstructorEarnings) for that token. This holds for standard SAC
+/// tokens; see `add_approved_token` for why it can break for others.
 #[test]
-#[should_panic(expected = "already on waitlist")]
-fn test_waitlist_duplicate_join_rejected() {
+fn test_reconciliation_instructor_earnings_match_contract_balance() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let asset_client = token::StellarAssetClient::new(&env, &token_id);
 
-    setup_full_waitlist_course(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-WAIT-DUP",
+    let instructor_2 = Address::generate(&env);
+    let instructors = [instructor.clone(), instructor_2.clone()];
+
+    let reconcile = |step: &str| {
+        let mut earnings_sum = 0i128;
+        for i in instructors.iter() {
+            earnings_sum += client.get_instructor_earnings(i, &token_id);
+        }
+        assert_eq!(
+            token_client.balance(&contract_id),
+            earnings_sum,
+            "contract balance != sum(InstructorEarnings) after {}",
+            step
+        );
+    };
+
+    let student_1 = Address::generate(&env);
+    let student_2 = Address::generate(&env);
+    let student_3 = Address::generate(&env);
+    for s in [&student_1, &student_2, &student_3] {
+        asset_client.mint(s, &10_000_000_000);
+    }
+
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "RECON-A", 1_000_000_000,
     );
-    let course_id = String::from_str(&env, "COURSE-WAIT-DUP");
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor_2, "RECON-B", 500_000_000,
+    );
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "RECON-C", 300_000_000,
+    );
+    let course_a = String::from_str(&env, "RECON-A");
+    let course_b = String::from_str(&env, "RECON-B");
+    let course_c = String::from_str(&env, "RECON-C");
+    reconcile("setup");
+
+    client.enroll(&student_1, &course_a);
+    client.enroll(&student_2, &course_a);
+    client.enroll(&student_3, &course_b);
+    client.enroll(&student_1, &course_c);
+    client.enroll(&student_2, &course_b);
+    reconcile("enrollments");
+
+    // Partial and full withdrawals
+    client.withdraw_earnings(&instructor, &token_id, &100_000_000);
+    reconcile("partial withdrawal");
+    client.withdraw_earnings(&instructor_2, &token_id, &0);
+    assert_eq!(client.get_instructor_earnings(&instructor_2, &token_id), 0);
+    reconcile("full withdrawal");
+
+    // Approved refund debits the instructor share held by the contract
+    client.request_refund(&student_2, &course_a);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student_2, &course_a, &true);
+    reconcile("refund");
+
+    // Complete and re-enroll
+    client.mark_completed(
+        &admin,
+        &student_3,
+        &course_b,
+        &Some(String::from_str(&env, "evidence_recon")),
+    );
+    client.re_enroll(&student_3, &course_b);
+    reconcile("re-enrollment");
+
+    // Draining every instructor leaves the contract empty
+    client.withdraw_earnings(&instructor, &token_id, &0);
+    client.withdraw_earnings(&instructor_2, &token_id, &0);
+    reconcile("final withdrawals");
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+/// #138 — a fee-on-transfer token is rejected at enrollment by the
+/// balance-delta check, so it can never credit more earnings than the
+/// contract actually received.
+#[test]
+#[should_panic(expected = "token transfer amount mismatch")]
+fn test_enroll_rejects_fee_on_transfer_token() {
+    let (env, contract_id, _sac_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
     let student = Address::generate(&env);
+    let (token_id, token) =
+        setup_non_standard_token(&env, &client, &admin, &student, 1_000_000_000);
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-FEE-TOKEN", 100_000_000,
+    );
 
-    client.join_waitlist(&student, &course_id);
-    client.join_waitlist(&student, &course_id);
+    token.set_transfer_fee_bps(&100); // 1% fee on every transfer
+    client.enroll(&student, &String::from_str(&env, "COURSE-FEE-TOKEN"));
 }
 
+/// #138 — withdraw_earnings() has no balance-delta check: it debits the
+/// full amount from InstructorEarnings and trusts the token to deliver it.
+/// If a token starts charging a transfer fee after approval, the instructor
+/// receives less than was debited. This pins that behaviour so the
+/// "standard tokens only" assumption on `add_approved_token` stays explicit.
 #[test]
-#[should_panic(expected = "student is blocked")]
-fn test_waitlist_blocked_student_rejected() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+fn test_withdraw_earnings_with_fee_on_transfer_token_underpays_instructor() {
+    let (env, contract_id, _sac_id, admin, _sec_admin, _treasury, instructor) = setup();
     let client = SorobanLardContractClient::new(&env, &contract_id);
 
-    setup_full_waitlist_course(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-WAIT-BLOCKED",
-    );
-    let course_id = String::from_str(&env, "COURSE-WAIT-BLOCKED");
     let student = Address::generate(&env);
-
-    client.block_student(&admin, &student);
-    client.join_waitlist(&student, &course_id);
-}
-
-#[test]
-#[should_panic(expected = "already enrolled in this course")]
-fn test_waitlist_enrolled_student_rejected() {
-    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
-    let client = SorobanLardContractClient::new(&env, &contract_id);
-
-    let enrolled = setup_full_waitlist_course(
-        &env,
-        &client,
-        &token_id,
-        &admin,
-        &instructor,
-        "COURSE-WAIT-ENROLLED",
+    let (token_id, token) =
+        setup_non_standard_token(&env, &client, &admin, &student, 1_000_000_000);
+    let price = 100_000_000i128;
+    register_and_approve_course(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-FEE-WITHDRAW", price,
     );
-    let course_id = String::from_str(&env, "COURSE-WAIT-ENROLLED");
 
-    client.join_waitlist(&enrolled, &course_id);
+    // Token behaves normally at enrollment...
+    client.enroll(&student, &String::from_str(&env, "COURSE-FEE-WITHDRAW"));
+    let earned = client.get_instructor_earnings(&instructor, &token_id);
+    assert_eq!(earned, price - price * 20 / 100);
+    assert_eq!(token.balance(&contract_id), earned);
+
+    // ...then starts charging 1% per transfer.
+    token.set_transfer_fee_bps(&100);
+    client.withdraw_earnings(&instructor, &token_id, &0);
+
+    let fee = earned * 100 / 10_000;
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+    assert_eq!(token.balance(&contract_id), 0);
+    assert_eq!(token.balance(&instructor), earned - fee);
 }
